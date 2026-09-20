@@ -40,9 +40,21 @@ export const CALDAV_ACCOUNT_RESOURCE: SupportedResource = {
   icon: { url: CALDAV_LOGO_URL },
 };
 
-export const SUPPORTED_RESOURCES: SupportedResource[] = [CALDAV_CALENDAR_RESOURCE, CALDAV_ACCOUNT_RESOURCE];
+export const CALDAV_SUBSCRIPTION_RESOURCE: SupportedResource = {
+  urlPattern: `${RESOURCE_ORIGIN}/subscription`,
+  title: "Subscribed calendar",
+  description: "Read events from one published calendar link (an .ics or webcal feed). Read-only.",
+  icon: { url: CALDAV_LOGO_URL },
+};
 
-export type ResourceTarget = { kind: "account" } | { kind: "calendar"; calendarId: string };
+export const SUPPORTED_RESOURCES: SupportedResource[] = [
+  CALDAV_CALENDAR_RESOURCE, CALDAV_ACCOUNT_RESOURCE, CALDAV_SUBSCRIPTION_RESOURCE,
+];
+
+export type ResourceTarget =
+  | { kind: "account" }
+  | { kind: "calendar"; calendarId: string }
+  | { kind: "subscription" };
 
 export function toAccountResourceUrl(): string {
   return `${RESOURCE_ORIGIN}/account`;
@@ -52,8 +64,14 @@ export function toCalendarResourceUrl(calendarId: string): string {
   return `${RESOURCE_ORIGIN}/calendar/${encodeURIComponent(calendarId)}`;
 }
 
+export function toSubscriptionResourceUrl(): string {
+  return `${RESOURCE_ORIGIN}/subscription`;
+}
+
 export function toResourceUrl(target: ResourceTarget): string {
-  return target.kind === "account" ? toAccountResourceUrl() : toCalendarResourceUrl(target.calendarId);
+  if (target.kind === "account") return toAccountResourceUrl();
+  if (target.kind === "subscription") return toSubscriptionResourceUrl();
+  return toCalendarResourceUrl(target.calendarId);
 }
 
 /** Parses a bound resource URL. Throws `INVALID_RESOURCE` on anything else. */
@@ -68,6 +86,7 @@ export function parseResourceUrl(url: string): ResourceTarget {
     throw new CalDavError("INVALID_RESOURCE", `CalDAV resource URLs must start with ${RESOURCE_ORIGIN}/.`);
   }
   if (parsed.pathname === "/account") return { kind: "account" };
+  if (parsed.pathname === "/subscription") return { kind: "subscription" };
   const match = /^\/calendar\/([^/]+)$/.exec(parsed.pathname);
   if (match) {
     let calendarId: string;

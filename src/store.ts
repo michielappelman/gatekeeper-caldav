@@ -11,6 +11,7 @@
 
 import {
   deleteObject,
+  fetchIcsFeed,
   getObject,
   listCalendars,
   objectUrl,
@@ -21,7 +22,16 @@ import {
   type FetchLike,
 } from "./caldav-api";
 import { CalDavError } from "./errors";
-import { applyOp, eventsInWindow, sortEvents, type CalendarContext, type EventOp } from "./events";
+import {
+  applyOp,
+  eventsInWindow,
+  eventsInWindowOf,
+  feedMetadata,
+  sortEvents,
+  splitFeedObjects,
+  type CalendarContext,
+  type EventOp,
+} from "./events";
 import type { CalDavEvent } from "./types";
 
 /** The subset of `DurableObjectStorage["kv"]` this module needs, for easy unit testing. */
@@ -31,12 +41,53 @@ export type CacheKv = {
   delete(key: string): boolean | void;
 };
 
-/** What the gatekeeper stores for a connected account. Never leaves the UserAccount/gatekeeper DOs. */
-export type Grant = Credentials & {
+/** A connected CalDAV account: credentials plus what discovery resolved from them. */
+export type CalDavGrant = Credentials & {
+  kind: "caldav";
   serverUrl: string;
   homeUrl: string;
   addresses: string[];
   displayName?: string;
+};
+
+/** A subscribed public calendar link. No credentials: the feed is world-readable and read-only. */
+export type IcsGrant = {
+  kind: "ics";
+  /** The normalized https feed URL. */
+  url: string;
+  /** Display name, from the feed's own X-WR-CALNAME when it has one. */
+  name: string;
+};
+
+/** What the gatekeeper stores for a connection. Never leaves the UserAccount/gatekeeper DOs. */
+export type Grant = CalDavGrant | IcsGrant;
+
+/**
+ * Reads a stored grant. Grants written before subscriptions existed carry no `kind`; they are all
+ * CalDAV accounts, so default to that rather than orphaning live connections.
+ */
+export function normalizeGrant(stored: Grant | (Omit<CalDavGrant, "kind"> & { kind?: "caldav" })): Grant {
+  return stored.kind === "ics" ? stored : { ...stored, kind: "caldav" };
+}
+
+/** Narrows a grant to a CalDAV account, for the paths that speak the protocol. */
+export function requireCalDavGrant(grant: Grant): CalDavGrant {
+  if (grant.kind !== "caldav") {
+    throw new CalDavError("INVALID_RESOURCE", "This connection is a subscribed calendar link, not a CalDAV account.");
+  }
+  return grant;
+}
+
+/**
+ * What a `CalDavSession` needs from whatever is behind it: a CalDAV account (`CalendarStore`) or a
+ * subscribed feed (`SubscriptionStore`).
+ */
+export type SessionBackend = {
+  calendar(calendarId: string): Promise<CalendarRecord>;
+  context(calendar: CalendarRecord): Promise<CalendarContext>;
+  listEvents(calendar: CalendarRecord, window: { startMs: number; endMs: number }, includeDescriptions: boolean): Promise<CalDavEvent[]>;
+  currentText(calendar: CalendarRecord, objectName: string): Promise<string | null>;
+  recordPending(calendar: CalendarRecord, objectName: string, op: EventOp): number;
 };
 
 /** The UserAccount surface the store uses (a DO stub in production, a fake in tests). */
@@ -97,7 +148,7 @@ export function listPending(kv: CacheKv, calendarId: string): { actionId: number
 
 type Window = { startMs: number; endMs: number };
 
-export class CalendarStore {
+export class CalendarStore implements SessionBackend {
   readonly #account: AccountAccess;
   readonly #kv: CacheKv;
   readonly #fetch: FetchLike;
@@ -114,8 +165,8 @@ export class CalendarStore {
   }
 
   /** Runs a CalDAV call, turning rejected credentials into a reconnect prompt. */
-  async #call<T>(fn: (grant: Grant) => Promise<T>): Promise<T> {
-    const grant = await this.#account.getGrant();
+  async #call<T>(fn: (grant: CalDavGrant) => Promise<T>): Promise<T> {
+    const grant = requireCalDavGrant(await this.#account.getGrant());
     try {
       return await fn(grant);
     } catch (error) {
@@ -149,7 +200,7 @@ export class CalendarStore {
   }
 
   async context(calendar: CalendarRecord): Promise<CalendarContext> {
-    const grant = await this.#account.getGrant();
+    const grant = requireCalDavGrant(await this.#account.getGrant());
     return { calendarId: calendar.id, defaultTz: calendar.timeZone ?? "UTC", selfAddresses: grant.addresses };
   }
 
@@ -264,5 +315,125 @@ export class CalendarStore {
 
   reject(actionId: number): void {
     deletePending(this.#kv, actionId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Subscribed calendar links
+
+/** The single calendar id a subscription binding exposes. */
+export const SUBSCRIPTION_CALENDAR_ID = "subscription";
+
+/** How long a fetched feed is served before it is revalidated with the publisher. */
+export const FEED_CACHE_TTL_MS = 5 * 60_000;
+
+/**
+ * A fetched feed, held in memory by the gatekeeper DO. Feeds routinely exceed the 128 KiB Durable
+ * Object value limit, so the body is not persisted; a cold DO simply fetches again.
+ */
+export type FeedCache = {
+  url?: string;
+  text?: string;
+  etag?: string;
+  lastModified?: string;
+  fetchedAt?: number;
+};
+
+/**
+ * Read-only backend over one published calendar link. Shares `CalDavSession` with the CalDAV
+ * account backend, so an agent sees the same API; the calendar reports `readOnly: true` and the
+ * write paths are unreachable (the session refuses them before reaching here).
+ */
+export class SubscriptionStore implements SessionBackend {
+  readonly #account: Pick<AccountAccess, "getGrant">;
+  readonly #cache: FeedCache;
+  readonly #fetch: FetchLike;
+
+  constructor(
+    account: Pick<AccountAccess, "getGrant">, cache: FeedCache,
+    fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  ) {
+    this.#account = account;
+    this.#cache = cache;
+    this.#fetch = fetchImpl;
+  }
+
+  async #grant(): Promise<IcsGrant> {
+    const grant = await this.#account.getGrant();
+    if (grant.kind !== "ics") {
+      throw new CalDavError("INVALID_RESOURCE", "This connection is a CalDAV account, not a subscribed calendar.");
+    }
+    return grant;
+  }
+
+  /** The feed body, revalidated with the publisher once the cached copy is older than the TTL. */
+  async #body(now = Date.now()): Promise<string> {
+    const grant = await this.#grant();
+    const cache = this.#cache;
+    const fresh = cache.url === grant.url && cache.text !== undefined &&
+      cache.fetchedAt !== undefined && now - cache.fetchedAt < FEED_CACHE_TTL_MS;
+    if (fresh) return cache.text!;
+
+    const reusable = cache.url === grant.url && cache.text !== undefined;
+    const result = await fetchIcsFeed(
+      grant.url, reusable ? { etag: cache.etag, lastModified: cache.lastModified } : {}, this.#fetch);
+    if (result.status === "notModified" && reusable) {
+      cache.fetchedAt = now;
+      return cache.text!;
+    }
+    if (result.status === "notModified") {
+      // 304 with nothing cached (a stale validator from another URL): ask again unconditionally.
+      const retry = await fetchIcsFeed(grant.url, {}, this.#fetch);
+      if (retry.status === "notModified") {
+        throw new CalDavError("UPSTREAM_UNAVAILABLE", "The published calendar did not return its contents.");
+      }
+      Object.assign(cache, { url: grant.url, text: retry.text, etag: retry.etag, lastModified: retry.lastModified, fetchedAt: now });
+      return retry.text;
+    }
+    Object.assign(cache, { url: grant.url, text: result.text, etag: result.etag, lastModified: result.lastModified, fetchedAt: now });
+    return result.text;
+  }
+
+  async calendar(calendarId: string = SUBSCRIPTION_CALENDAR_ID): Promise<CalendarRecord> {
+    if (calendarId !== SUBSCRIPTION_CALENDAR_ID) {
+      throw new CalDavError("RESOURCE_NOT_FOUND", "This connection is a single subscribed calendar.");
+    }
+    const grant = await this.#grant();
+    const metadata = feedMetadata(await this.#body());
+    return {
+      id: SUBSCRIPTION_CALENDAR_ID,
+      url: grant.url,
+      name: metadata.name || grant.name,
+      timeZone: metadata.timeZone,
+      readOnly: true,
+    };
+  }
+
+  async context(calendar: CalendarRecord): Promise<CalendarContext> {
+    // A feed is somebody else's calendar: the connected user is never an attendee "self".
+    return { calendarId: calendar.id, defaultTz: calendar.timeZone ?? "UTC", selfAddresses: [] };
+  }
+
+  async listEvents(
+    calendar: CalendarRecord, window: { startMs: number; endMs: number }, includeDescriptions: boolean,
+  ): Promise<CalDavEvent[]> {
+    const context = await this.context(calendar);
+    const events: CalDavEvent[] = [];
+    for (const object of splitFeedObjects(await this.#body())) {
+      events.push(...eventsInWindowOf(object.name, object.calendar, context, window, includeDescriptions));
+      if (events.length > MAX_EVENTS) {
+        throw new CalDavError("TOO_MANY_EVENTS", "Too many events in this window; narrow it and retry.");
+      }
+    }
+    return sortEvents(events);
+  }
+
+  // Writes never reach here: the calendar reports `readOnly`, which the session checks first.
+  async currentText(): Promise<string | null> {
+    throw new CalDavError("READ_ONLY", "A subscribed calendar cannot be changed.");
+  }
+
+  recordPending(): number {
+    throw new CalDavError("READ_ONLY", "A subscribed calendar cannot be changed.");
   }
 }

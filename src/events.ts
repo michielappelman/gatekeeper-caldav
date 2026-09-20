@@ -38,7 +38,7 @@ import {
   type ICalDateTime,
 } from "./ical";
 import { describeRRule, expandRecurrence, formatRRule, parseRRule, type RRule } from "./recurrence";
-import { buildVTimezone, isValidTimeZone, utcToZoned } from "./timezone";
+import { buildVTimezone, isValidTimeZone, normalizeTzid, utcToZoned } from "./timezone";
 import type {
   CalDavAlert,
   CalDavAttendee,
@@ -248,7 +248,13 @@ function masterInstances(master: ICalComponent, rule: RRule | undefined, window:
 export function eventsInWindow(
   objectName: string, text: string, context: CalendarContext, window: Window, includeDescriptions: boolean,
 ): CalDavEvent[] {
-  const calendar = parseICalendar(text);
+  return eventsInWindowOf(objectName, parseICalendar(text), context, window, includeDescriptions);
+}
+
+/** As `eventsInWindow`, for an already-parsed object (a feed is split into these without a round trip). */
+export function eventsInWindowOf(
+  objectName: string, calendar: ICalComponent, context: CalendarContext, window: Window, includeDescriptions: boolean,
+): CalDavEvent[] {
   const { master, overrides } = splitVEvents(calendar);
   const events: CalDavEvent[] = [];
   const rule = master ? parseRule(master) : undefined;
@@ -635,3 +641,52 @@ export function titleOf(text: string | null, target: EventTarget, context: Calen
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Published calendar feeds (ICS)
+
+/** What a feed says about itself, for naming the connection and reading its floating times. */
+export function feedMetadata(text: string): { name?: string; timeZone?: string } {
+  const calendar = parseICalendar(text);
+  const declared = getText(calendar, "X-WR-TIMEZONE");
+  const firstTimezone = calendar.components.find(component => component.name === "VTIMEZONE");
+  const tzid = declared ?? (firstTimezone ? getProperty(firstTimezone, "TZID")?.value : undefined);
+  return {
+    name: getText(calendar, "X-WR-CALNAME"),
+    timeZone: tzid ? normalizeTzid(tzid) : undefined,
+  };
+}
+
+/**
+ * Splits a feed — one VCALENDAR holding many events — into one object per UID, the shape the rest of
+ * this module works in (a series and its RECURRENCE-ID overrides travel together). The calendar's
+ * own properties and VTIMEZONEs are carried into each object, since its events may reference them.
+ */
+export function splitFeedObjects(text: string): { name: string; calendar: ICalComponent }[] {
+  const feed = parseICalendar(text);
+  const timezones = feed.components.filter(component => component.name === "VTIMEZONE");
+  const properties = feed.properties.filter(property => !property.name.startsWith("X-WR-"));
+  const groups = new Map<string, ICalComponent[]>();
+  let withoutUid = 0;
+  for (const event of feed.components.filter(component => component.name === "VEVENT")) {
+    const uid = getProperty(event, "UID")?.value || `no-uid-${++withoutUid}`;
+    const group = groups.get(uid);
+    if (group) group.push(event);
+    else groups.set(uid, [event]);
+  }
+
+  const taken = new Set<string>();
+  const objects: { name: string; calendar: ICalComponent }[] = [];
+  for (const [uid, events] of groups) {
+    // Feed ids are labels, not addresses: nothing writes back to a feed, but they must still be
+    // unique within the feed and safe to echo in an event id.
+    let name = uid.replace(/[^A-Za-z0-9@._~+-]/g, "_").slice(0, 120) || "event";
+    for (let i = 2; taken.has(name); i++) name = `${name}_${i}`;
+    taken.add(name);
+    objects.push({
+      name,
+      calendar: { name: "VCALENDAR", properties: [...properties], components: [...timezones, ...events] },
+    });
+  }
+  return objects;
+}

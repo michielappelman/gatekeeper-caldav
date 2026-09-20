@@ -34,8 +34,10 @@ import {
 } from "@gadgets/gatekeeper-kit/connect-nonce";
 import {
   discoverAccount,
+  fetchIcsFeed,
   ICLOUD_CALDAV_URL,
   listCalendars,
+  normalizeFeedUrl,
   normalizeServerUrl,
   type CalendarRecord,
 } from "./caldav-api";
@@ -44,6 +46,7 @@ import {
   applyOp,
   buildEventObject,
   describeTime,
+  feedMetadata,
   MAX_WINDOW_MS,
   parseEventId,
   sortEvents,
@@ -54,13 +57,24 @@ import {
   CALDAV_ACCOUNT_RESOURCE,
   CALDAV_CALENDAR_RESOURCE,
   CALDAV_LOGO_URL,
+  CALDAV_SUBSCRIPTION_RESOURCE,
   parseResourceUrl,
   SUPPORTED_RESOURCES,
   toAccountResourceUrl,
   toResourceUrl,
+  toSubscriptionResourceUrl,
   type ResourceTarget,
 } from "./resource";
-import { CalendarStore, MAX_EVENTS, type Grant } from "./store";
+import {
+  CalendarStore,
+  MAX_EVENTS,
+  normalizeGrant,
+  SUBSCRIPTION_CALENDAR_ID,
+  SubscriptionStore,
+  type FeedCache,
+  type Grant,
+  type SessionBackend,
+} from "./store";
 import { describeNow, zonedToUtc } from "./timezone";
 import type { CalDavAccountSession, CalDavBusyBlock } from "./account-types";
 import type {
@@ -76,11 +90,13 @@ import { accountTypeBundle } from "./type-bundle";
 import TYPES_CODE from "./types.txt";
 import ACCOUNT_TYPES_CODE from "./account-types.txt";
 import type { CalDavAccountConfiguratorRpc } from "./configurator/caldav-account-configurator-types";
+import type { CalDavSubscriptionConfiguratorRpc } from "./configurator/caldav-subscription-configurator-types";
 import type {
   CalDavCalendarConfiguratorRpc,
   ConfiguratorOption,
 } from "./configurator/caldav-calendar-configurator-types";
 import CALDAV_ACCOUNT_CONFIGURATOR_HTML from "./generated/caldav-account-configurator-ui.txt";
+import CALDAV_SUBSCRIPTION_CONFIGURATOR_HTML from "./generated/caldav-subscription-configurator-ui.txt";
 import CALDAV_CALENDAR_CONFIGURATOR_HTML from "./generated/caldav-calendar-configurator-ui.txt";
 
 type Env = Cloudflare.Env & {
@@ -114,13 +130,16 @@ function getBasePath(env: Env): string {
   return path === "/" ? "" : path;
 }
 
+/** Which kind of connection the connect form is creating. */
+type ConnectMode = "caldav" | "ics";
+
 // ---------------------------------------------------------------------------
 // Connect flow. CalDAV servers (iCloud included) authenticate with a username and password — for
 // iCloud an app-specific password — so, as with gatekeeper-homeassistant's long-lived token, the
 // human pastes a credential and the gatekeeper verifies it by discovering the calendar home.
 
 const CONNECT_FORM_HTML = (params: {
-  actionUrl: string; error?: string; serverUrl?: string; username?: string;
+  actionUrl: string; error?: string; mode?: ConnectMode; serverUrl?: string; username?: string; feedUrl?: string;
 }) => `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -140,14 +159,20 @@ const CONNECT_FORM_HTML = (params: {
   button { margin-top: 1.5rem; padding: 0.6rem 1.5rem; background: #c62828; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
   button:hover { background: #a61f1f; }
   .error { background: #ffebee; color: #c62828; padding: 0.75rem 1rem; border-radius: 4px; margin: 1rem 0; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; margin: 1.25rem 0 0; padding: 0 1rem 1rem; }
+  legend { font-weight: 600; padding: 0 0.4rem; }
+  legend input { width: auto; margin-right: 0.4rem; }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>Connect a calendar</h1>
-    <p>Connect iCloud Calendar, or any other CalDAV server, so Cloudflare OS can read and manage your events.</p>
+    <p>Connect iCloud Calendar or any other CalDAV server so Cloudflare OS can read and manage your
+    events, or subscribe to a published calendar link to read someone else's public calendar.</p>
     ${params.error ? `<div class="error">${escapeHtml(params.error)}</div>` : ""}
     <form method="POST" action="${escapeHtml(params.actionUrl)}">
+      <fieldset>
+        <legend><label><input type="radio" name="mode" value="caldav"${params.mode === "ics" ? "" : " checked"}>Calendar account</label></legend>
       <label for="serverUrl">CalDAV server</label>
       <input id="serverUrl" name="serverUrl" type="text" required value="${escapeHtml(params.serverUrl ?? ICLOUD_CALDAV_URL)}">
       <div class="hint">Leave as is for iCloud.</div>
@@ -168,6 +193,15 @@ const CONNECT_FORM_HTML = (params: {
           <li>Paste it above. You can revoke it there at any time.</li>
         </ol>
       </details>
+      </fieldset>
+
+      <fieldset>
+        <legend><label><input type="radio" name="mode" value="ics"${params.mode === "ics" ? " checked" : ""}>Published calendar link</label></legend>
+        <label for="feedUrl">Calendar link (.ics or webcal)</label>
+        <input id="feedUrl" name="feedUrl" type="text" value="${escapeHtml(params.feedUrl ?? "")}" placeholder="https://example.com/holidays.ics">
+        <div class="hint">A public, read-only calendar feed &mdash; a team calendar, a holiday
+        calendar, a sports schedule. No password is needed, and events on it cannot be changed.</div>
+      </fieldset>
 
       <button type="submit">Connect</button>
     </form>
@@ -207,15 +241,22 @@ export default {
         } catch {
           return new Response("Invalid form submission.", { status: 400 });
         }
+        const mode: ConnectMode = formData.get("mode") === "ics" ? "ics" : "caldav";
         const serverUrl = String(formData.get("serverUrl") ?? "").trim();
         const username = String(formData.get("username") ?? "").trim();
         const password = String(formData.get("password") ?? "");
-        const form = { actionUrl: req.url, serverUrl, username };
-        if (!serverUrl || !username || !password) {
+        const feedUrl = String(formData.get("feedUrl") ?? "").trim();
+        const form = { actionUrl: req.url, mode, serverUrl, username, feedUrl };
+        if (mode === "ics" && !feedUrl) {
+          return htmlResponse(CONNECT_FORM_HTML({ ...form, error: "Enter the published calendar link." }), 400);
+        }
+        if (mode === "caldav" && (!serverUrl || !username || !password)) {
           return htmlResponse(CONNECT_FORM_HTML({ ...form, error: "Server, username, and password are all required." }), 400);
         }
 
-        const result = await stub.completeConnection(nonce, { serverUrl, username, password });
+        const result = await stub.completeConnection(nonce, mode === "ics"
+          ? { mode: "ics", feedUrl }
+          : { mode: "caldav", serverUrl, username, password });
         if (result.kind === "invalid_nonce") {
           return htmlResponse(errorPageHtml("Link expired", "Start the connection again."));
         }
@@ -277,6 +318,15 @@ type StoredNonce = TimedNonce & {
   connecting?: true;
 };
 
+/** How a connected account presents itself, whichever kind it is. */
+type AccountIdentity = {
+  kind: "caldav" | "ics";
+  /** The account's username, or the subscribed calendar's name. */
+  username: string;
+  serverHost: string;
+  displayName?: string;
+};
+
 type CompleteConnectionResult =
   | { kind: "ok"; handoff: ConnectHandoff }
   | { kind: "invalid_nonce" }
@@ -326,7 +376,10 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async completeConnection(
-    nonce: string, input: { serverUrl: string; username: string; password: string },
+    nonce: string,
+    input:
+      | { mode: "caldav"; serverUrl: string; username: string; password: string }
+      | { mode: "ics"; feedUrl: string },
   ): Promise<CompleteConnectionResult> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.connecting || !isLiveNonce(stored, nonce, Date.now())) {
@@ -337,21 +390,40 @@ export class UserAccount extends DurableObject<Env> {
 
     let grant: Grant;
     try {
-      const serverUrl = normalizeServerUrl(input.serverUrl);
-      const credentials = { username: input.username, password: input.password };
-      const info = await discoverAccount(serverUrl, credentials);
-      const existing = this.ctx.storage.kv.get<Grant>("grant");
-      if (stored.reconnect && existing && existing.homeUrl !== info.homeUrl) {
-        // Bindings made under this connection name calendars of the original account; silently
-        // repointing them at another account's calendars would be surprising at best.
-        throw new CalDavError("INVALID_ARGUMENT",
-          "Those credentials belong to a different calendar account. Reconnect with the original account, " +
-          "or add a new connection instead.");
+      const existing = this.#storedGrant();
+      if (stored.reconnect && existing && existing.kind !== input.mode) {
+        throw new CalDavError("INVALID_ARGUMENT", existing.kind === "ics"
+          ? "This connection is a subscribed calendar link. Reconnect it with a calendar link, or add a new connection."
+          : "This connection is a calendar account. Reconnect it with that account, or add a new connection.");
       }
-      grant = { serverUrl, ...credentials, ...info };
+      if (input.mode === "ics") {
+        const url = normalizeFeedUrl(input.feedUrl);
+        if (stored.reconnect && existing?.kind === "ics" && existing.url !== url) {
+          throw new CalDavError("INVALID_ARGUMENT",
+            "That is a different calendar link. Reconnect with the original link, or add a new connection instead.");
+        }
+        // Fetching it is the check: a link that cannot be read publicly is not a connection.
+        const feed = await fetchIcsFeed(url);
+        const text = feed.status === "ok" ? feed.text : "";
+        grant = { kind: "ics", url, name: feedMetadata(text).name || new URL(url).hostname };
+      } else {
+        const serverUrl = normalizeServerUrl(input.serverUrl);
+        const credentials = { username: input.username, password: input.password };
+        const info = await discoverAccount(serverUrl, credentials);
+        if (stored.reconnect && existing?.kind === "caldav" && existing.homeUrl !== info.homeUrl) {
+          // Bindings made under this connection name calendars of the original account; silently
+          // repointing them at another account's calendars would be surprising at best.
+          throw new CalDavError("INVALID_ARGUMENT",
+            "Those credentials belong to a different calendar account. Reconnect with the original account, " +
+            "or add a new connection instead.");
+        }
+        grant = { kind: "caldav", serverUrl, ...credentials, ...info };
+      }
     } catch (error) {
       this.#releaseNonceClaim(nonce);
-      logFailure("connect.failed", error, { serverHost: safeHost(input.serverUrl) });
+      logFailure("connect.failed", error, {
+        serverHost: safeHost(input.mode === "ics" ? input.feedUrl : input.serverUrl),
+      });
       return { kind: "error", message: connectErrorMessage(error) };
     }
 
@@ -392,15 +464,26 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put("expiredNotified", false);
   }
 
-  async getIdentity(): Promise<{ username: string; serverHost: string; displayName?: string } | undefined> {
-    const grant = this.ctx.storage.kv.get<Grant>("grant");
-    return grant
-      ? { username: grant.username, serverHost: new URL(grant.serverUrl).hostname, displayName: grant.displayName }
-      : undefined;
+  /** The stored grant, normalized (grants written before subscriptions existed carry no `kind`). */
+  #storedGrant(): Grant | undefined {
+    const stored = this.ctx.storage.kv.get<Grant>("grant");
+    return stored ? normalizeGrant(stored) : undefined;
+  }
+
+  async getIdentity(): Promise<AccountIdentity | undefined> {
+    const grant = this.#storedGrant();
+    if (!grant) return undefined;
+    if (grant.kind === "ics") {
+      return { kind: "ics", username: grant.name, serverHost: new URL(grant.url).hostname };
+    }
+    return {
+      kind: "caldav", username: grant.username, serverHost: new URL(grant.serverUrl).hostname,
+      displayName: grant.displayName,
+    };
   }
 
   async getGrant(): Promise<Grant> {
-    const grant = this.ctx.storage.kv.get<Grant>("grant");
+    const grant = this.#storedGrant();
     if (!grant) throw new CalDavError("AUTH_REQUIRED", "The calendar account is not connected.");
     return grant;
   }
@@ -416,6 +499,9 @@ export class UserAccount extends DurableObject<Env> {
   /** For the calendar picker. */
   async listCalendars(): Promise<CalendarRecord[]> {
     const grant = await this.getGrant();
+    if (grant.kind === "ics") {
+      return [{ id: SUBSCRIPTION_CALENDAR_ID, url: grant.url, name: grant.name, readOnly: true }];
+    }
     try {
       return await listCalendars(grant.homeUrl, grant);
     } catch (error) {
@@ -457,6 +543,13 @@ export class CalDavGatekeeperUserImpl extends WorkerEntrypoint<Env, CalDavUserIm
 
   async describe(): Promise<AccountDescription> {
     const identity = await this.#userAccount().getIdentity();
+    if (identity?.kind === "ics") {
+      return {
+        displayName: `${identity.username} (subscribed calendar)`,
+        uniqueName: `ics:${identity.username}@${identity.serverHost}`,
+        avatar: { url: CALDAV_LOGO_URL },
+      };
+    }
     return {
       displayName: identity ? `${identity.username} (${identity.serverHost})` : "Calendar account",
       uniqueName: identity ? `${identity.username}@${identity.serverHost}` : undefined,
@@ -464,8 +557,11 @@ export class CalDavGatekeeperUserImpl extends WorkerEntrypoint<Env, CalDavUserIm
     };
   }
 
+  /** A subscription offers only itself; an account offers its calendars and the whole-account view. */
   async getSupportedResources(): Promise<SupportedResource[]> {
-    return SUPPORTED_RESOURCES;
+    const identity = await this.#userAccount().getIdentity();
+    if (identity?.kind === "ics") return [CALDAV_SUBSCRIPTION_RESOURCE];
+    return [CALDAV_CALENDAR_RESOURCE, CALDAV_ACCOUNT_RESOURCE];
   }
 
   async getGatekeeperClassFor(url: string): Promise<{
@@ -473,10 +569,20 @@ export class CalDavGatekeeperUserImpl extends WorkerEntrypoint<Env, CalDavUserIm
     resource: SupportedResource;
   }> {
     const target = parseResourceUrl(url);
+    // The connection kind decides which resources exist: a CalDAV account has no feed behind it,
+    // and a subscription has no account to enumerate.
+    const identity = await this.#userAccount().getIdentity();
+    const isSubscription = identity?.kind === "ics";
+    if (isSubscription !== (target.kind === "subscription")) {
+      throw new CalDavError("INVALID_RESOURCE", isSubscription
+        ? "This connection is a subscribed calendar link; bind the subscribed calendar instead."
+        : "This connection is a calendar account; bind one of its calendars instead.");
+    }
     const props: CalDavGatekeeperImplProps = { userObjectId: this.ctx.props.userObjectId, target };
     return {
       class: this.ctx.exports.CalDavGatekeeperImpl({ props }),
-      resource: target.kind === "account" ? CALDAV_ACCOUNT_RESOURCE : CALDAV_CALENDAR_RESOURCE,
+      resource: target.kind === "account" ? CALDAV_ACCOUNT_RESOURCE
+        : target.kind === "subscription" ? CALDAV_SUBSCRIPTION_RESOURCE : CALDAV_CALENDAR_RESOURCE,
     };
   }
 
@@ -489,6 +595,12 @@ export class CalDavGatekeeperUserImpl extends WorkerEntrypoint<Env, CalDavUserIm
     }
     if (resourceUrlPattern === CALDAV_ACCOUNT_RESOURCE.urlPattern) {
       return { iframeHtml: CALDAV_ACCOUNT_CONFIGURATOR_HTML, ui: new RpcStub(new CalDavAccountConfiguratorUI()) };
+    }
+    if (resourceUrlPattern === CALDAV_SUBSCRIPTION_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: CALDAV_SUBSCRIPTION_CONFIGURATOR_HTML,
+        ui: new RpcStub(new CalDavSubscriptionConfiguratorUI()),
+      };
     }
     throw new Error(`Unsupported CalDAV resource configurator type: ${resourceUrlPattern}`);
   }
@@ -561,6 +673,13 @@ export class CalDavAccountConfiguratorUI extends RpcTarget implements CalDavAcco
   }
 }
 
+@validateRpc()
+export class CalDavSubscriptionConfiguratorUI extends RpcTarget implements CalDavSubscriptionConfiguratorRpc {
+  async resourceUrl(): Promise<string> {
+    return toSubscriptionResourceUrl();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Gatekeeper DO — one binding: either one calendar or the whole account.
 
@@ -579,6 +698,17 @@ export class CalDavGatekeeperImpl extends DurableObject<Env, CalDavGatekeeperImp
     return new CalendarStore(this.#userAccount(), this.ctx.storage.kv, (event, error) => logFailure(event, error));
   }
 
+  /** The fetched feed of a subscription binding. Feeds are too large for Durable Object storage,
+   * so this lives only as long as the instance; a cold start just fetches again. */
+  #feedCache: FeedCache = {};
+
+  /** Whichever backend this binding's sessions read through. */
+  #backend(): SessionBackend {
+    return this.ctx.props.target.kind === "subscription"
+      ? new SubscriptionStore(this.#userAccount(), this.#feedCache)
+      : this.#store();
+  }
+
   async describe(): Promise<ResourceDescription> {
     const target = this.ctx.props.target;
     const identity = await this.#userAccount().getIdentity();
@@ -590,6 +720,21 @@ export class CalDavGatekeeperImpl extends DurableObject<Env, CalDavGatekeeperImp
         snippet: `Read events and busy time across every calendar of ${account}, and manage events on them.`,
         suggestedBindingName: "CALENDARS",
         tsType: "CalDavAccountSession",
+      };
+    }
+    if (target.kind === "subscription") {
+      let name = identity?.username ?? "Subscribed calendar";
+      try {
+        name = (await this.#backend().calendar(SUBSCRIPTION_CALENDAR_ID)).name;
+      } catch (error) {
+        logFailure("describe.lookupFailed", error);
+      }
+      return {
+        url: toResourceUrl(target),
+        title: `Calendar: ${name}`,
+        snippet: `Read events and busy time from the subscribed calendar "${name}". Read-only.`,
+        suggestedBindingName: "CALENDAR",
+        tsType: "CalDavSession",
       };
     }
     let name = target.calendarId;
@@ -620,10 +765,11 @@ export class CalDavGatekeeperImpl extends DurableObject<Env, CalDavGatekeeperImp
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<CalDavSession | CalDavAccountSession> {
-    const store = this.#store();
     const target = this.ctx.props.target;
-    if (target.kind === "account") return new CalDavAccountSessionImpl(approvalQueue.dup(), store);
-    return new CalDavSessionImpl(approvalQueue.dup(), store, target.calendarId);
+    if (target.kind === "account") return new CalDavAccountSessionImpl(approvalQueue.dup(), this.#store());
+    return new CalDavSessionImpl(
+      approvalQueue.dup(), this.#backend(),
+      target.kind === "subscription" ? SUBSCRIPTION_CALENDAR_ID : target.calendarId);
   }
 
   /** Action ids being applied in this instance, so a concurrent second approval can't apply twice. */
@@ -705,10 +851,10 @@ function assertWritable(calendar: CalendarRecord): void {
 @validateRpc()
 export class CalDavSessionImpl extends RpcTarget implements CalDavSession {
   #approvalQueue: RpcStub<ApprovalQueue>;
-  #store: CalendarStore;
+  #store: SessionBackend;
   #calendarId: string;
 
-  constructor(approvalQueue: RpcStub<ApprovalQueue>, store: CalendarStore, calendarId: string) {
+  constructor(approvalQueue: RpcStub<ApprovalQueue>, store: SessionBackend, calendarId: string) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#store = store;

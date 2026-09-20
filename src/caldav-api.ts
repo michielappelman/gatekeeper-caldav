@@ -314,3 +314,90 @@ export async function deleteObject(
   }, credentials, fetchImpl);
   await response.body?.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// Published calendar links (ICS feeds)
+//
+// A subscription is an ordinary HTTPS GET of one iCalendar document, with no credentials: the feed
+// is world-readable by whoever holds the link. Publishers expect polling, so conditional requests
+// (ETag / Last-Modified) are used whenever a cached copy exists.
+
+/** Largest feed body accepted, to bound memory in the Worker. */
+export const MAX_FEED_BYTES = 8 * 1024 * 1024;
+
+/** Normalizes a published calendar link. Accepts `webcal:`, which is `https:` by another name. */
+export function normalizeFeedUrl(input: string): string {
+  // `webcal:` is a non-special scheme, and the URL protocol setter refuses to turn one into
+  // `https:`, so the swap happens on the text before parsing.
+  const trimmed = input.trim().replace(/^webcal:\/\//i, "https://");
+  let url: URL;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+  } catch {
+    throw new CalDavError("INVALID_ARGUMENT", "The calendar link is not a valid URL.");
+  }
+  if (url.protocol !== "https:") {
+    throw new CalDavError("INVALID_ARGUMENT", "The calendar link must use https (or webcal).");
+  }
+  if (url.username || url.password) {
+    throw new CalDavError("INVALID_ARGUMENT", "A published calendar link must not contain a username or password.");
+  }
+  url.hash = "";
+  return url.toString();
+}
+
+export type FeedValidators = { etag?: string; lastModified?: string };
+
+export type FeedFetchResult =
+  | { status: "notModified" }
+  | { status: "ok"; text: string; etag?: string; lastModified?: string };
+
+/** Fetches a published calendar, returning `notModified` when the cached copy is still current. */
+export async function fetchIcsFeed(
+  url: string, validators: FeedValidators = {}, fetchImpl: FetchLike = fetch,
+): Promise<FeedFetchResult> {
+  const headers: Record<string, string> = { Accept: "text/calendar, text/plain;q=0.9, */*;q=0.8" };
+  if (validators.etag) headers["If-None-Match"] = validators.etag;
+  else if (validators.lastModified) headers["If-Modified-Since"] = validators.lastModified;
+
+  let response: Response;
+  try {
+    response = await fetchImpl(url, { method: "GET", headers, redirect: "follow" });
+  } catch (error) {
+    throw new CalDavError("UPSTREAM_UNAVAILABLE", "Could not reach the published calendar.", { cause: error });
+  }
+  if (response.status === 304) {
+    await response.body?.cancel();
+    return { status: "notModified" };
+  }
+  if (!response.ok) {
+    await response.body?.cancel();
+    const error = errorForStatus(response.status);
+    // Nobody is signed in to a public link, so 401/403 means the link is not public (or no longer).
+    if (response.status === 401 || response.status === 403) {
+      throw new CalDavError("FORBIDDEN", "That calendar link is not publicly readable.", { cause: error });
+    }
+    throw error;
+  }
+
+  const declaredLength = Number(response.headers.get("Content-Length") ?? Number.NaN);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_FEED_BYTES) {
+    await response.body?.cancel();
+    throw new CalDavError("TOO_MANY_EVENTS", "That calendar feed is too large to read.");
+  }
+  const text = await response.text();
+  if (text.length > MAX_FEED_BYTES) {
+    throw new CalDavError("TOO_MANY_EVENTS", "That calendar feed is too large to read.");
+  }
+  if (!/BEGIN:VCALENDAR/i.test(text)) {
+    throw new CalDavError(
+      "INVALID_ARGUMENT",
+      "That link did not return a calendar file. Use the published .ics link, not the web page that shows it.");
+  }
+  return {
+    status: "ok",
+    text,
+    etag: response.headers.get("ETag") ?? undefined,
+    lastModified: response.headers.get("Last-Modified") ?? undefined,
+  };
+}

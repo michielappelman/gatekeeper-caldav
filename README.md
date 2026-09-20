@@ -1,6 +1,7 @@
 # gatekeeper-caldav
 
-A Cloudflare OS Gatekeeper for iCloud Calendar and any other CalDAV server, following the upstream
+A Cloudflare OS Gatekeeper for iCloud Calendar, any other CalDAV server, and published calendar
+links (.ics / webcal feeds), following the upstream
 `write-gatekeeper` skill (`cloudflare-os/.agents/skills/write-gatekeeper/SKILL.md`). The
 agent-facing API (`src/types.d.ts`) deliberately mirrors upstream's Google Calendar session so
 agents see the same shapes across providers.
@@ -11,7 +12,9 @@ This package lives in-repo (not a submodule). It is built and deployed by `scrip
 
 ## Auth
 
-Apple offers no OAuth for iCloud Calendar; CalDAV uses HTTP Basic auth. The connect form asks for
+A connection is one of two kinds, chosen on the connect form.
+
+**A calendar account (CalDAV).** Apple offers no OAuth for iCloud Calendar; CalDAV uses HTTP Basic auth. The connect form asks for
 a server URL (default `https://caldav.icloud.com/`), a username (the Apple Account email), and a
 password — for iCloud an **app-specific password** from account.apple.com, never the account
 password. Discovery (`current-user-principal` → `calendar-home-set`, falling back to
@@ -26,12 +29,22 @@ calendar home, so existing bindings can't be silently repointed at a different a
 Redirects are followed by hand and only to `https:` URLs, so credentials are never sent in clear.
 No deployment-wide secret is needed.
 
+**A published calendar link (ICS).** A public feed — a holiday calendar, a team calendar, a sports
+schedule — needs no credentials: the link itself is the capability, and anyone holding it can read
+the feed. `webcal:` links are accepted and read over https. Fetching the feed is the check, so a
+link that is not publicly readable (401/403) or does not return a calendar is refused at connect
+time rather than stored. Subscriptions are read-only, and reconnecting must keep the same link.
+
+The two kinds never mix: a connection offers either its calendars or its one subscribed calendar,
+and binding the wrong resource kind is refused.
+
 ## Resources
 
 | Resource | URL | Session |
 | --- | --- | --- |
 | One calendar | `https://caldav.local/calendar/<calendarId>` | `CalDavSession` |
 | All calendars | `https://caldav.local/account` | `CalDavAccountSession` |
+| Subscribed calendar | `https://caldav.local/subscription` | `CalDavSession` (read-only) |
 
 CalDAV servers live on arbitrary hosts and the binding already belongs to one connected account,
 so resource URLs use the fixed synthetic host `caldav.local` (as Home Assistant uses
@@ -60,6 +73,11 @@ patterns are deployed identity — don't change them.
   replays the same op on a freshly fetched copy with `If-Match` (or `If-None-Match: *` for creates),
   retrying once on a concurrent edit. A failed apply stays approvable. Approving an update to a
   not-yet-created event fails with a clear message until the create is approved.
+- **Feeds.** A subscription is one GET of one iCalendar document, revalidated with ETag /
+  Last-Modified after a 5-minute TTL and capped at 8 MB. The body is held in the gatekeeper DO's
+  memory, not its storage, since feeds routinely exceed the 128 KiB value limit; a cold start
+  refetches. `splitFeedObjects()` divides the feed into one object per UID so the same reader,
+  recurrence expansion, and override handling serve feeds and CalDAV objects alike.
 - **Observers.** Strategy A (private-only): CalDAV offers no per-observer access oracle, so
   bindings can't be shared.
 - **Self-describing bindings.** The Workshop names a chat binding with a quick model that sees only
@@ -90,6 +108,8 @@ a live iCloud account; the post-deploy checklist in the root README covers that.
 
 - Events only: no reminders or tasks (VTODO), no creating/deleting calendars, no moving events
   between calendars, and no writing attendees.
+- A subscribed calendar is read-only and exposes exactly one calendar; the whole-account session is
+  not offered for it.
 - `getBusyTime` covers only the connected account's own calendars; CalDAV scheduling free-busy for
   other people is not implemented.
 - The calendar list is cached for 60 seconds.

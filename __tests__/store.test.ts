@@ -15,7 +15,8 @@ function makeKv(): CacheKv {
 const HOME = "https://caldav.example.com/cal/";
 const CALENDAR_URL = `${HOME}home/`;
 const GRANT: Grant = {
-  serverUrl: "https://caldav.example.com/", username: "me", password: "pw", homeUrl: HOME, addresses: [],
+  kind: "caldav", serverUrl: "https://caldav.example.com/", username: "me", password: "pw",
+  homeUrl: HOME, addresses: [],
 };
 const WINDOW = { startMs: Date.parse("2026-09-01T00:00:00Z"), endMs: Date.parse("2026-10-01T00:00:00Z") };
 
