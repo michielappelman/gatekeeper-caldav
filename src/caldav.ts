@@ -138,7 +138,7 @@ type ConnectMode = "caldav" | "ics";
 // iCloud an app-specific password — so, as with gatekeeper-homeassistant's long-lived token, the
 // human pastes a credential and the gatekeeper verifies it by discovering the calendar home.
 
-const CONNECT_FORM_HTML = (params: {
+export const CONNECT_FORM_HTML = (params: {
   actionUrl: string; error?: string; mode?: ConnectMode; serverUrl?: string; username?: string; feedUrl?: string;
 }) => `<!DOCTYPE html>
 <html lang="en">
@@ -159,7 +159,8 @@ const CONNECT_FORM_HTML = (params: {
   button { margin-top: 1.5rem; padding: 0.6rem 1.5rem; background: #c62828; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
   button:hover { background: #a61f1f; }
   .error { background: #ffebee; color: #c62828; padding: 0.75rem 1rem; border-radius: 4px; margin: 1rem 0; }
-  fieldset { border: 1px solid #ddd; border-radius: 6px; margin: 1.25rem 0 0; padding: 0 1rem 1rem; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; margin: 1.25rem 0 0; padding: 0 1rem 1rem; transition: opacity 0.15s; }
+  fieldset[data-inactive] { opacity: 0.5; }
   legend { font-weight: 600; padding: 0 0.4rem; }
   legend input { width: auto; margin-right: 0.4rem; }
 </style>
@@ -171,18 +172,18 @@ const CONNECT_FORM_HTML = (params: {
     events, or subscribe to a published calendar link to read someone else's public calendar.</p>
     ${params.error ? `<div class="error">${escapeHtml(params.error)}</div>` : ""}
     <form method="POST" action="${escapeHtml(params.actionUrl)}">
-      <fieldset>
+      <fieldset data-mode="caldav">
         <legend><label><input type="radio" name="mode" value="caldav"${params.mode === "ics" ? "" : " checked"}>Calendar account</label></legend>
       <label for="serverUrl">CalDAV server</label>
-      <input id="serverUrl" name="serverUrl" type="text" required value="${escapeHtml(params.serverUrl ?? ICLOUD_CALDAV_URL)}">
+      <input id="serverUrl" name="serverUrl" type="text" value="${escapeHtml(params.serverUrl ?? ICLOUD_CALDAV_URL)}">
       <div class="hint">Leave as is for iCloud.</div>
 
       <label for="username">Username</label>
-      <input id="username" name="username" type="text" required autocomplete="username" value="${escapeHtml(params.username ?? "")}" placeholder="you@icloud.com" autofocus>
+      <input id="username" name="username" type="text" autocomplete="username" value="${escapeHtml(params.username ?? "")}" placeholder="you@icloud.com"${params.mode === "ics" ? "" : " autofocus"}>
       <div class="hint">For iCloud, your Apple Account email address.</div>
 
       <label for="password">Password</label>
-      <input id="password" name="password" type="password" required autocomplete="off">
+      <input id="password" name="password" type="password" autocomplete="off">
       <div class="hint">For iCloud, an app-specific password — never your Apple Account password.</div>
 
       <details open>
@@ -195,10 +196,10 @@ const CONNECT_FORM_HTML = (params: {
       </details>
       </fieldset>
 
-      <fieldset>
+      <fieldset data-mode="ics">
         <legend><label><input type="radio" name="mode" value="ics"${params.mode === "ics" ? " checked" : ""}>Published calendar link</label></legend>
         <label for="feedUrl">Calendar link (.ics or webcal)</label>
-        <input id="feedUrl" name="feedUrl" type="text" value="${escapeHtml(params.feedUrl ?? "")}" placeholder="https://example.com/holidays.ics">
+        <input id="feedUrl" name="feedUrl" type="text" value="${escapeHtml(params.feedUrl ?? "")}" placeholder="https://example.com/holidays.ics"${params.mode === "ics" ? " autofocus" : ""}>
         <div class="hint">A public, read-only calendar feed &mdash; a team calendar, a holiday
         calendar, a sports schedule. No password is needed, and events on it cannot be changed.</div>
       </fieldset>
@@ -206,6 +207,31 @@ const CONNECT_FORM_HTML = (params: {
       <button type="submit">Connect</button>
     </form>
   </div>
+<script>
+  var sets = document.querySelectorAll("fieldset[data-mode]");
+  function sync() {
+    var chosen = document.querySelector('input[name="mode"]:checked');
+    sets.forEach(function (set) {
+      set.toggleAttribute("data-inactive", !chosen || set.dataset.mode !== chosen.value);
+    });
+  }
+  document.querySelectorAll('input[name="mode"]').forEach(function (radio) {
+    radio.addEventListener("change", sync);
+  });
+  // Typing in a field picks the kind of connection it belongs to.
+  sets.forEach(function (set) {
+    set.querySelectorAll('input:not([name="mode"])').forEach(function (field) {
+      field.addEventListener("focus", function () {
+        var radio = set.querySelector('input[name="mode"]');
+        if (!radio.checked) {
+          radio.checked = true;
+          sync();
+        }
+      });
+    });
+  });
+  sync();
+</script>
 </body>
 </html>`;
 
