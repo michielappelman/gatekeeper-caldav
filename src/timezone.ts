@@ -209,3 +209,38 @@ export function buildVTimezone(timeZone: string, referenceYear: number): string[
   lines.push("END:VTIMEZONE");
   return lines;
 }
+
+// ---------------------------------------------------------------------------
+// Current-time context
+
+const WEEKDAY_NAMES = [
+  "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+] as const;
+
+/** Formats a zone offset the way a date-time string carries it, e.g. `+02:00`. */
+export function formatUtcOffset(epochMs: number, timeZone: string): string {
+  const offset = offsetMs(epochMs, timeZone);
+  const sign = offset < 0 ? "-" : "+";
+  const minutes = Math.abs(offset) / 60_000;
+  return `${sign}${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+/**
+ * Describes "now" in `timeZone`: the fields an agent needs to turn a phrase like "next week" into
+ * a concrete window without guessing the date, the weekday, or the zone.
+ */
+export function describeNow(epochMs: number, timeZone: string): {
+  now: Date; timeZone: string; today: string; localTime: string; weekday: string; utcOffset: string;
+} {
+  const local = utcToZoned(epochMs, timeZone);
+  const today = `${pad(local.year, 4)}-${pad(local.month)}-${pad(local.day)}`;
+  const weekday = WEEKDAY_NAMES[new Date(Date.UTC(local.year, local.month - 1, local.day)).getUTCDay()];
+  return {
+    now: new Date(epochMs),
+    timeZone,
+    today,
+    localTime: `${today}T${pad(local.hour)}:${pad(local.minute)}:${pad(local.second)}`,
+    weekday,
+    utcOffset: formatUtcOffset(epochMs, timeZone),
+  };
+}

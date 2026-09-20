@@ -62,6 +62,16 @@ patterns are deployed identity — don't change them.
   not-yet-created event fails with a clear message until the create is approved.
 - **Observers.** Strategy A (private-only): CalDAV offers no per-observer access oracle, so
   bindings can't be shared.
+- **Self-describing bindings.** The Workshop names a chat binding with a quick model that sees only
+  `describe().title`, so a calendar's title is `Calendar: <name>` (and a whole-account binding's is
+  `All calendars: <user>`). A bare name like "Personal" gets bound as something like
+  `PERSONAL_INFO`, which tells the agent nothing about what the binding is.
+- **Per-binding types.** Each binding's `getTypeScriptTypes()` returns only its own session's API,
+  so a single-calendar binding is never shown the whole-account session it cannot reach; the vendor
+  returns both. `src/type-bundle.ts` strips a declaration's module imports when flattening.
+- **Clock.** Both sessions expose `getCurrentTime()`, returning today's date, the local time, the
+  weekday, and the zone offset in the calendar's own time zone, so relative requests like "next
+  week" don't depend on the agent guessing the date or the zone.
 
 ## Development
 

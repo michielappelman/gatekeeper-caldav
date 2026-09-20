@@ -61,18 +61,20 @@ import {
   type ResourceTarget,
 } from "./resource";
 import { CalendarStore, MAX_EVENTS, type Grant } from "./store";
-import { zonedToUtc } from "./timezone";
+import { describeNow, zonedToUtc } from "./timezone";
+import type { CalDavAccountSession, CalDavBusyBlock } from "./account-types";
 import type {
-  CalDavAccountSession,
-  CalDavBusyBlock,
   CalDavCalendarInfo,
   CalDavEvent,
   CalDavEventDraft,
   CalDavEventPatch,
   CalDavListEventsOptions,
   CalDavSession,
+  CalDavTimeContext,
 } from "./types";
+import { accountTypeBundle } from "./type-bundle";
 import TYPES_CODE from "./types.txt";
+import ACCOUNT_TYPES_CODE from "./account-types.txt";
 import type { CalDavAccountConfiguratorRpc } from "./configurator/caldav-account-configurator-types";
 import type {
   CalDavCalendarConfiguratorRpc,
@@ -260,7 +262,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return TYPES_CODE;
+    return accountTypeBundle(TYPES_CODE, ACCOUNT_TYPES_CODE);
   }
 }
 
@@ -584,7 +586,7 @@ export class CalDavGatekeeperImpl extends DurableObject<Env, CalDavGatekeeperImp
     if (target.kind === "account") {
       return {
         url: toResourceUrl(target),
-        title: identity ? `All calendars of ${identity.username}` : "All calendars",
+        title: identity ? `All calendars: ${identity.username}` : "All calendars",
         snippet: `Read events and busy time across every calendar of ${account}, and manage events on them.`,
         suggestedBindingName: "CALENDARS",
         tsType: "CalDavAccountSession",
@@ -598,7 +600,9 @@ export class CalDavGatekeeperImpl extends DurableObject<Env, CalDavGatekeeperImp
     }
     return {
       url: toResourceUrl(target),
-      title: name,
+      // The chat binding name is generated from this title alone, so it must name the resource
+      // *and* say what it is; "Personal" on its own gets bound as something like PERSONAL_INFO.
+      title: `Calendar: ${name}`,
       snippet: `Read and manage events on the "${name}" calendar of ${account}.`,
       suggestedBindingName: "CALENDAR",
       tsType: "CalDavSession",
@@ -606,7 +610,9 @@ export class CalDavGatekeeperImpl extends DurableObject<Env, CalDavGatekeeperImp
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return TYPES_CODE;
+    return this.ctx.props.target.kind === "account"
+      ? accountTypeBundle(TYPES_CODE, ACCOUNT_TYPES_CODE)
+      : TYPES_CODE;
   }
 
   async getAutoApprovableActions() {
@@ -713,6 +719,11 @@ export class CalDavSessionImpl extends RpcTarget implements CalDavSession {
     this.#approvalQueue[Symbol.dispose]();
   }
 
+  async getCurrentTime(): Promise<CalDavTimeContext> {
+    const calendar = await this.#store.calendar(this.#calendarId);
+    return describeNow(Date.now(), calendar.timeZone ?? "UTC");
+  }
+
   async getCalendar(): Promise<CalDavCalendarInfo> {
     const calendar = await this.#store.calendar(this.#calendarId);
     await this.#approvalQueue.authorizeObservation({
@@ -803,6 +814,14 @@ export class CalDavAccountSessionImpl extends RpcTarget implements CalDavAccount
 
   [Symbol.dispose]() {
     this.#approvalQueue[Symbol.dispose]();
+  }
+
+  async getCurrentTime(): Promise<CalDavTimeContext> {
+    const zones = (await this.#store.calendars()).flatMap(calendar => calendar.timeZone ?? []);
+    const counts = new Map<string, number>();
+    for (const zone of zones) counts.set(zone, (counts.get(zone) ?? 0) + 1);
+    const commonest = [...counts].toSorted((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+    return describeNow(Date.now(), commonest?.[0] ?? "UTC");
   }
 
   async listCalendars(): Promise<CalDavCalendarInfo[]> {

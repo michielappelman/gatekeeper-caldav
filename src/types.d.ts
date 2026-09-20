@@ -1,6 +1,6 @@
 /** Metadata about one calendar. */
 export type CalDavCalendarInfo = {
-  /** Stable calendar id. Pass this to `CalDavAccountSession.getCalendar()`. */
+  /** Stable id of this calendar within the connected account. */
   id: string;
   /** Display name, as shown in the Calendar app. */
   name: string;
@@ -135,8 +135,25 @@ export type CalDavListEventsOptions = {
   includeDescriptions?: boolean;
 };
 
-/** A busy interval. No event details are included. */
-export type CalDavBusyBlock = { start: Date; end: Date };
+/**
+ * The current date and time, as the calendar itself sees it. Use this to turn a relative phrase
+ * like "next week" or "tomorrow afternoon" into a concrete window or start time, instead of
+ * assuming a date or a zone.
+ */
+export type CalDavTimeContext = {
+  /** The current instant. */
+  now: Date;
+  /** IANA zone the other fields are expressed in, e.g. `Europe/Amsterdam`. */
+  timeZone: string;
+  /** Today's date in `timeZone`, as `YYYY-MM-DD`. */
+  today: string;
+  /** The current local date and time in `timeZone`, as `YYYY-MM-DDTHH:MM:SS`. */
+  localTime: string;
+  /** Today's weekday name in `timeZone`, e.g. `Monday`. */
+  weekday: string;
+  /** `timeZone`'s current offset from UTC, e.g. `+02:00`. */
+  utcOffset: string;
+};
 
 /**
  * Read-write access to one calendar on a CalDAV server (such as iCloud). The calendar was chosen
@@ -145,6 +162,12 @@ export type CalDavBusyBlock = { start: Date; end: Date };
 export interface CalDavSession {
   /** Returns metadata about this calendar. */
   getCalendar(): Promise<CalDavCalendarInfo>;
+
+  /**
+   * Returns the current date and time in this calendar's own time zone. Call this before working
+   * out a window from a relative phrase such as "next week".
+   */
+  getCurrentTime(): Promise<CalDavTimeContext>;
 
   /**
    * Lists every event overlapping the window, sorted by start. Repeating events are expanded into
@@ -184,29 +207,4 @@ export interface CalDavSession {
    * to delete the whole series. Events with attendees cannot be deleted here and throw.
    */
   deleteEvent(id: string): Promise<void>;
-}
-
-/**
- * Access to every calendar of one connected CalDAV account (such as iCloud). The account was
- * chosen when this connection was created and cannot be changed from here.
- */
-export interface CalDavAccountSession {
-  /** Lists the account's event calendars (task and reminder lists are not included). */
-  listCalendars(): Promise<CalDavCalendarInfo[]>;
-
-  /** Opens one calendar by `CalDavCalendarInfo.id`. */
-  getCalendar(calendarId: string): Promise<CalDavSession>;
-
-  /**
-   * Lists events across all of the account's calendars, sorted by start. Same semantics as
-   * `CalDavSession.listEvents()`; use each event's `calendarId` to tell them apart.
-   */
-  listEvents(opts: CalDavListEventsOptions): Promise<CalDavEvent[]>;
-
-  /**
-   * Returns merged busy time across all of the account's calendars in the window, ignoring events
-   * marked free or cancelled. Overlapping and adjacent blocks are merged. Useful for finding a slot
-   * without reading event details.
-   */
-  getBusyTime(opts: { start: Date; end: Date }): Promise<CalDavBusyBlock[]>;
 }

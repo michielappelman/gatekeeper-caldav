@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildVTimezone, normalizeTzid, utcToZoned, zonedToUtc } from "../src/timezone";
+import { buildVTimezone, describeNow, normalizeTzid, utcToZoned, zonedToUtc } from "../src/timezone";
 
 describe("zonedToUtc / utcToZoned", () => {
   it("converts summer and winter wall times in Europe/Amsterdam", () => {
@@ -44,5 +44,31 @@ describe("buildVTimezone", () => {
     const lines = buildVTimezone("Asia/Tokyo", 2026);
     expect(lines.filter(line => line === "BEGIN:STANDARD")).toHaveLength(1);
     expect(lines).toContain("TZOFFSETTO:+0900");
+  });
+});
+
+describe("describeNow", () => {
+  it("reports the date, weekday, and offset as the calendar's zone sees them", () => {
+    // 00:30 UTC on a Sunday is already Sunday 02:30 in Amsterdam (summer time).
+    const at = Date.parse("2026-07-05T00:30:00Z");
+    expect(describeNow(at, "Europe/Amsterdam")).toEqual({
+      now: new Date(at),
+      timeZone: "Europe/Amsterdam",
+      today: "2026-07-05",
+      localTime: "2026-07-05T02:30:00",
+      weekday: "Sunday",
+      utcOffset: "+02:00",
+    });
+  });
+
+  it("reports the previous local day when the zone is behind UTC", () => {
+    const at = Date.parse("2026-01-05T02:00:00Z");
+    expect(describeNow(at, "America/New_York")).toMatchObject({
+      today: "2026-01-04", localTime: "2026-01-04T21:00:00", weekday: "Sunday", utcOffset: "-05:00",
+    });
+  });
+
+  it("handles a half-hour offset", () => {
+    expect(describeNow(Date.parse("2026-07-05T00:30:00Z"), "Asia/Kolkata").utcOffset).toBe("+05:30");
   });
 });
