@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.wrangler/
+wrangler.prod.jsonc
+
+# Generated at build/deploy time by @gadgets/scripts' gatekeeper-configurator task.
+src/generated/*-configurator-ui.txt
+src/generated/*-configurator-ui.js*
