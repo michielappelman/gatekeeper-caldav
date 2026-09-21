@@ -6,9 +6,44 @@ links (.ics / webcal feeds), following the upstream
 agent-facing API (`src/types.d.ts`) deliberately mirrors upstream's Google Calendar session so
 agents see the same shapes across providers.
 
-This package lives in-repo (not a submodule). It is built and deployed by `scripts/deploy.ts` as
-`workers.caldav` and bound as `GATEKEEPER_CALDAV`, so the router serves its connect flow at
-`/gatekeeper/caldav`.
+## Use in another Cloudflare OS starter
+
+This repository is designed to be consumed as a Git submodule by a
+[`cloudflare-os-starter`](https://github.com/cloudflare/cloudflare-os-starter)-style deployment.
+It is not an npm package: its `@gadgets/*` dependencies are resolved from the pinned Cloudflare OS
+workspace in the consuming starter, which keeps the Gatekeeper Kit ABI aligned with the deployment.
+
+From the root of the starter:
+
+```sh
+git submodule add https://github.com/michielappelman/gatekeeper-caldav.git packages/gatekeeper-caldav
+git submodule update --init --recursive
+pnpm install
+```
+
+The starter must include `packages/*` in `pnpm-workspace.yaml`, and its deploy wrapper must treat
+`packages/gatekeeper-caldav` as the CalDAV Worker package. In practice that means:
+
+1. Read this package's `wrangler.jsonc` as the base CalDAV config.
+2. Generate the production config with the deployment's account, Worker name, service bindings,
+   `BASE_URL` (`<origin>/gatekeeper/caldav`), and observability settings.
+3. Run `vp run -F gatekeeper-caldav --no-cache build` before deploying the Worker.
+4. Deploy it before the Workshop and Router, which consume its service binding: on the Workshop
+   with the `GatekeeperVendor` entrypoint, on the Router (as `GATEKEEPER_CALDAV`) with none, so the
+   connect flow is served at `/gatekeeper/caldav`.
+5. Pin the submodule commit in the starter and record that commit in the deployment inventory.
+
+The starter's `workers.caldav.name` is the deployed Worker identity; it need not be
+`gatekeeper-caldav`. The public router is the only route: the CalDAV Worker should have no public
+or preview URL. Users supply their own credentials (or a public calendar link) through the
+Gatekeeper's connect flow, so no deployment-wide CalDAV secret is required.
+
+For local development and tests, run them from the consuming starter after the Cloudflare OS
+submodule is initialized (see [Development](#development)).
+
+Keep the Cloudflare OS submodule and this Gatekeeper pinned together. If either changes, run the
+Gatekeeper tests, the starter's type checks, and the full starter check before updating the
+submodule gitlinks.
 
 ## Auth
 
@@ -102,7 +137,7 @@ vp run -F gatekeeper-caldav --no-cache build   # configurator UIs + tsc
 Tests use mocked `fetch` and need no credentials. They cover iCalendar parsing and round-trips,
 time zones and VTIMEZONE generation, recurrence expansion, the event operations, CalDAV discovery
 and requests, simulation and apply, resources, and the configurators. Nothing here has run against
-a live iCloud account; the post-deploy checklist in the root README covers that.
+a live iCloud account; the consuming starter's post-deploy verification checklist covers that.
 
 ## Current scope
 
