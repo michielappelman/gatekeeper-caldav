@@ -22,6 +22,7 @@ import {
   escapeHtml,
   htmlResponse,
 } from "@gadgets/gatekeeper-kit/connect-pages";
+import type { RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   constantTimeEqual,
@@ -41,11 +42,11 @@ import {
   normalizeServerUrl,
   type CalendarRecord,
 } from "./caldav-api";
+import { describeCreate, describeDelete, describeUpdate } from "./approval";
 import { CalDavError } from "./errors";
 import {
   applyOp,
   buildEventObject,
-  describeTime,
   feedMetadata,
   MAX_WINDOW_MS,
   parseEventId,
@@ -916,14 +917,16 @@ export class CalDavSessionImpl extends RpcTarget implements CalDavSession {
     return events;
   }
 
-  async #submit(calendar: CalendarRecord, objectName: string, op: EventOp, kind: ActionKindTag, title: string, description: string): Promise<void> {
+  async #submit(
+      calendar: CalendarRecord, objectName: string, op: EventOp, kind: ActionKindTag, title: string,
+      description: RenderedDescription): Promise<void> {
     const actionId = this.#store.recordPending(calendar, objectName, op);
     // Not cleaned up on a thrown error: the overseer commits the action durably before
     // submitAction() returns, so a lost response can still mean a live, approvable action whose
     // journal entry applyAction() will need.
     await this.#approvalQueue.submitAction(actionId, {
       title,
-      description,
+      ...description,
       implementsRevert: false,
       actionKind: { tag: `event.${kind}`, label: `${kind[0].toUpperCase()}${kind.slice(1)} calendar events` },
     });
@@ -936,9 +939,7 @@ export class CalDavSessionImpl extends RpcTarget implements CalDavSession {
     const objectName = `${uid}.ics`;
     const ics = buildEventObject(event, uid, await this.#store.context(calendar), Date.now());
     await this.#submit(calendar, objectName, { kind: "create", objectName, ics }, "create",
-      "Create calendar event",
-      `Create "${event.title}" on "${calendar.name}" starting ${describeTime(event.start)}` +
-      `${event.recurrence ? `, repeating ${event.recurrence.frequency}` : ""}.`);
+      "Create calendar event", describeCreate(calendar.name, event, ics));
     return { id: objectName };
   }
 
@@ -950,12 +951,8 @@ export class CalDavSessionImpl extends RpcTarget implements CalDavSession {
     const current = await this.#store.currentText(calendar, target.objectName);
     const op: EventOp = { kind: "update", target, patch, now: Date.now() };
     applyOp(current, op, context); // validates: throws if the change can't apply
-    const title = titleOf(current, target, context) ?? "an event";
-    const changed = Object.keys(patch).filter(key => patch[key as keyof CalDavEventPatch] !== undefined);
     await this.#submit(calendar, target.objectName, op, "update", "Change calendar event",
-      `Change ${changed.join(", ") || "nothing"} of "${title}"` +
-      `${target.occurrence ? " (this occurrence only)" : ""} on "${calendar.name}"` +
-      `${patch.start ? `, now starting ${describeTime(patch.start)}` : ""}.`);
+      describeUpdate(calendar.name, titleOf(current, target, context), target.occurrence, patch));
   }
 
   async deleteEvent(id: string): Promise<void> {
@@ -966,10 +963,8 @@ export class CalDavSessionImpl extends RpcTarget implements CalDavSession {
     const current = await this.#store.currentText(calendar, target.objectName);
     const op: EventOp = { kind: "delete", target, now: Date.now() };
     applyOp(current, op, context);
-    const title = titleOf(current, target, context) ?? "an event";
     await this.#submit(calendar, target.objectName, op, "delete", "Delete calendar event",
-      `Delete "${title}"${target.occurrence ? ` (only the occurrence on ${target.occurrence.slice(0, 8)})` : ""} ` +
-      `from "${calendar.name}".`);
+      describeDelete(calendar.name, titleOf(current, target, context), target.occurrence));
   }
 }
 

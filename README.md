@@ -108,6 +108,10 @@ patterns are deployed identity — don't change them.
   replays the same op on a freshly fetched copy with `If-Match` (or `If-None-Match: *` for creates),
   retrying once on a concurrent edit. A failed apply stays approvable. Approving an update to a
   not-yet-created event fails with a clear message until the create is approved.
+- **What an approval shows** (`src/approval.ts`). A create lists every field in words (title,
+  start and end with their time zone, repeat rule, location, URL, busy/free, alerts, notes) and
+  then the iCalendar object exactly as uploaded. An update names the event and shows only the
+  fields that change; a delete names the event, and the occurrence for one of a repeating event.
 - **Feeds.** A subscription is one GET of one iCalendar document, revalidated with ETag /
   Last-Modified after a 5-minute TTL and capped at 8 MB. The body is held in the gatekeeper DO's
   memory, not its storage, since feeds routinely exceed the 128 KiB value limit; a cold start
