@@ -112,7 +112,18 @@ async function davFetch(request: DavRequest, credentials: Credentials, fetchImpl
       continue;
     }
     if (!response.ok && !request.allow?.includes(response.status)) {
-      await response.body?.cancel();
+      if (response.status === 412) {
+        // TEMPORARY diagnostics for the update/delete 412 investigation.
+        console.warn("caldav-412", JSON.stringify({
+          method: request.method, path: new URL(url).pathname,
+          ifMatch: request.headers?.["If-Match"], ifNoneMatch: request.headers?.["If-None-Match"],
+          responseHeaders: Object.fromEntries(response.headers),
+          responseBody: (await response.text()).slice(0, 4000),
+          requestBody: request.body?.slice(0, 4000),
+        }));
+      } else {
+        await response.body?.cancel();
+      }
       throw errorForStatus(response.status);
     }
     return { response, url };
