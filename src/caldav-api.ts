@@ -100,6 +100,9 @@ async function davFetch(request: DavRequest, credentials: Credentials, fetchImpl
         redirect: "manual",
       });
     } catch (error) {
+      console.warn("caldav-upstream-error", JSON.stringify({
+        method: request.method, path: new URL(url).pathname, error: String(error),
+      }));
       throw new CalDavError("UPSTREAM_UNAVAILABLE", "Could not reach the CalDAV server.", { cause: error });
     }
     if (response.status >= 300 && response.status < 400 && response.headers.get("Location")) {
@@ -112,23 +115,33 @@ async function davFetch(request: DavRequest, credentials: Credentials, fetchImpl
       continue;
     }
     if (!response.ok && !request.allow?.includes(response.status)) {
-      if (response.status === 412) {
-        // TEMPORARY diagnostics for the update/delete 412 investigation.
-        console.warn("caldav-412", JSON.stringify({
-          method: request.method, path: new URL(url).pathname,
-          ifMatch: request.headers?.["If-Match"], ifNoneMatch: request.headers?.["If-None-Match"],
-          responseHeaders: Object.fromEntries(response.headers),
-          responseBody: (await response.text()).slice(0, 4000),
-          requestBody: request.body?.slice(0, 4000),
-        }));
-      } else {
-        await response.body?.cancel();
-      }
+      await logFailedResponse(request, url, response);
       throw errorForStatus(response.status);
     }
     return { response, url };
   }
   throw new CalDavError("UPSTREAM_UNAVAILABLE", "The CalDAV server redirected too many times.");
+}
+
+const LOGGED_BODY_CHARS = 4000;
+
+/**
+ * Logs a failed CalDAV response for Workers Logs: servers explain rejections (a stale ETag, event
+ * data they refuse) only in the body. Never logs credentials; drops Set-Cookie.
+ */
+async function logFailedResponse(request: DavRequest, url: string, response: Response): Promise<void> {
+  let responseBody: string;
+  try {
+    responseBody = (await response.text()).slice(0, LOGGED_BODY_CHARS);
+  } catch (error) {
+    responseBody = `<unreadable: ${String(error)}>`;
+  }
+  const responseHeaders = Object.fromEntries([...response.headers].filter(([name]) => name.toLowerCase() !== "set-cookie"));
+  console.warn("caldav-upstream-error", JSON.stringify({
+    method: request.method, path: new URL(url).pathname, status: response.status,
+    requestHeaders: request.headers, responseHeaders, responseBody,
+    requestBody: request.body?.slice(0, LOGGED_BODY_CHARS),
+  }));
 }
 
 async function multistatus(request: DavRequest, credentials: Credentials, fetchImpl: FetchLike): Promise<{ responses: MultistatusResponse[]; url: string }> {
