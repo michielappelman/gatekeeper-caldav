@@ -280,14 +280,26 @@ export async function queryObjects(
   return objects;
 }
 
-/** Fetches one object, or null if it does not exist. */
+/**
+ * Fetches one object with its ETag, or null if it does not exist. Uses `calendar-multiget` rather
+ * than GET so the ETag is the `getetag` property: a plain GET's `ETag` header can be altered by
+ * content encoding (iCloud answers Workers' compressed GETs with a validator its own `If-Match`
+ * then rejects, so every update and delete failed with 412).
+ */
 export async function getObject(url: string, credentials: Credentials, fetchImpl: FetchLike = fetch): Promise<{ etag?: string; data: string } | null> {
-  const { response } = await davFetch({ method: "GET", url, allow: [404, 410] }, credentials, fetchImpl);
-  if (response.status === 404 || response.status === 410) {
-    await response.body?.cancel();
-    return null;
-  }
-  return { etag: response.headers.get("ETag") ?? undefined, data: await response.text() };
+  const target = new URL(url);
+  const body = `<?xml version="1.0" encoding="utf-8"?>` +
+    `<c:calendar-multiget xmlns:d="DAV:" xmlns:c="${CALDAV_NS}">` +
+    `<d:prop><d:getetag/><c:calendar-data/></d:prop>` +
+    `<d:href>${escapeXml(target.pathname)}</d:href></c:calendar-multiget>`;
+  const calendarUrl = new URL(".", target).toString();
+  const { responses } = await multistatus({
+    method: "REPORT", url: calendarUrl, headers: { Depth: "1" }, body,
+  }, credentials, fetchImpl);
+  const response = responses.find(entry => new URL(entry.href, calendarUrl).pathname === target.pathname);
+  const data = response?.props.get(propKey(CALDAV_NS, "calendar-data"))?.text;
+  if (!response || !data) return null;
+  return { etag: response.props.get(propKey(DAV_NS, "getetag"))?.text.trim() || undefined, data };
 }
 
 /**

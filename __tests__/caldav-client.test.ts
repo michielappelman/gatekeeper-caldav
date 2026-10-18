@@ -132,9 +132,20 @@ describe("calendar objects", () => {
     expect(calls[0].init.body).toContain(`<c:time-range start="20260901T000000Z" end="20261001T000000Z"/>`);
   });
 
-  it("gets, puts conditionally, and treats a missing object as deleted", async () => {
+  it("gets an object's etag from calendar-multiget, not a GET's ETag header", async () => {
+    const { fetchImpl, calls } = mockFetch(() => multistatus(
+      `<d:response><d:href>/1234/calendars/home/a%20b.ics</d:href><d:propstat><d:prop><d:getetag>"7"</d:getetag>` +
+      `<c:calendar-data>BEGIN:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`));
+    expect(await getObject(`${CALENDAR}a%20b.ics`, CREDS, fetchImpl)).toEqual({ etag: "\"7\"", data: "BEGIN:VCALENDAR" });
+    expect(calls[0].url).toBe(CALENDAR);
+    expect(calls[0].init.method).toBe("REPORT");
+    expect(calls[0].init.body).toContain("<d:href>/1234/calendars/home/a%20b.ics</d:href>");
+  });
+
+  it("puts conditionally and treats a missing object as deleted", async () => {
     const { fetchImpl, calls } = mockFetch(({ init }) => {
-      if (init.method === "GET") return new Response("", { status: 404 });
+      if (init.method === "REPORT") return multistatus(
+        `<d:response><d:href>/1234/calendars/home/a.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>`);
       if (init.method === "PUT") return new Response(null, { status: 201 });
       return new Response(null, { status: 404 });
     });

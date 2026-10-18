@@ -47,9 +47,7 @@ function fakeServer() {
     }
     const name = url.slice(CALENDAR_URL.length);
     const object = objects.get(name);
-    if (method === "GET") {
-      return object ? new Response(object.data, { headers: { ETag: `"${object.etag}"` } }) : new Response("", { status: 404 });
-    }
+    if (method === "GET") return new Response("", { status: 405 }); // objects are read via REPORT
     writes.push({ method, name, headers });
     if (conflictsLeft > 0) {
       conflictsLeft--;
