@@ -928,6 +928,7 @@ export class CalDavSessionImpl extends RpcTarget implements CalDavSession {
       title,
       ...description,
       implementsRevert: false,
+      autoApprovable: false,
       actionKind: { tag: `event.${kind}`, label: `${kind[0].toUpperCase()}${kind.slice(1)} calendar events` },
     });
   }
